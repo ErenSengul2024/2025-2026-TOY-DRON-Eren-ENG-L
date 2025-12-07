@@ -7,7 +7,7 @@ import time
 import math
 
 class PID:
-    def __init__(self, kp=0.0, ki=0.0, kd=0.0, imax=None, out_min=None, out_max=None):
+    def _init_(self, kp=0.0, ki=0.0, kd=0.0, imax=None, out_min=None, out_max=None):
         self.kp = kp
         self.ki = ki
         self.kd = kd
@@ -41,8 +41,8 @@ class PID:
         return out
 
 class FixedWingPID(Node):
-    def __init__(self):
-        super().__init__('fixed_wing_pid_controller')
+    def _init_(self):
+        super()._init_('fixed_wing_pid_controller')
 
         self.declare_parameter('xYel', 0.5)
         self.declare_parameter('yYel', 0.8)
@@ -100,15 +100,12 @@ class FixedWingPID(Node):
         self.publish_rate = 50.0  # Hz
         self.timer = self.create_timer(1.0/self.publish_rate, self.control_loop)
 
-        self.act_msg = ActuatorControl()
-        self.act_msg.group_mix = 0
         self.get_logger().info('FixedWingPID node started')
 
     def state_cb(self, msg: State):
         self.current_state = msg
 
     def target_cb(self, msg: Float32MultiArray):
-
         arr = msg.data
         if len(arr) < 5:
             self.get_logger().warning('target/box msg length <5; ignoring')
@@ -120,20 +117,19 @@ class FixedWingPID(Node):
         }
 
     def ensure_offboard_and_arm(self):
-
         if self.current_state is None:
             return False
         if self.current_state.mode != 'OFFBOARD':
             if self.cli_setmode.service_is_ready():
                 req = SetMode.Request()
                 req.custom_mode = 'OFFBOARD'
-                f = self.cli_setmode.call_async(req)
+                self.cli_setmode.call_async(req)
 
         if not self.current_state.armed:
             if self.cli_arm.service_is_ready():
                 req = CommandBool.Request()
                 req.value = True
-                f = self.cli_arm.call_async(req)
+                self.cli_arm.call_async(req)
         return True
 
     def control_loop(self):
@@ -146,7 +142,6 @@ class FixedWingPID(Node):
         self.ensure_offboard_and_arm()
 
         if self.last_target is None:
-
             self.publish_neutral()
             return
 
@@ -157,52 +152,36 @@ class FixedWingPID(Node):
         red_ok_y = (h >= self.yRed)
         red_ok = red_ok_x and red_ok_y
 
-        err_x = (0.5 - cx)  # positive -> target is to left -> need positive aileron to roll right (sign mapping later)
-
+        err_x = (0.5 - cx)
         err_y = (0.5 - cy)
 
-        roll_cmd = self.roll_pid.update(err_x, dt)     # -1..1 (aileron)
-        pitch_cmd = self.pitch_pid.update(err_y, dt)   # elevator deflection [-0.5,0.5] (nose up/down)
-        throttle_cmd = self.throttle_pid.update(size_err, dt)  # 0..1
+        roll_cmd = self.roll_pid.update(err_x, dt)
+        pitch_cmd = self.pitch_pid.update(err_y, dt)
+        throttle_cmd = self.throttle_pid.update(0.0, dt)  # örnek: size_err yoksa 0
 
         aileron = float(max(min(roll_cmd, 1.0), -1.0))
         elevator = float(max(min(pitch_cmd, 0.5), -0.5))
-        rudder = 0.0  # not used in this simple controller
-
-        base_throttle = 0.45  # cruise throttle guess; tune for your plane
+        rudder = 0.0
+        base_throttle = 0.45
         throttle = float(max(min(base_throttle + throttle_cmd, 1.0), 0.0))
 
         inside_x_yellow = (abs(cx - 0.5) <= (self.xYel/2.0))
         inside_y_yellow = (abs(cy - 0.5) <= (self.yYel/2.0))
         if red_ok and inside_x_yellow and inside_y_yellow:
-
             aileron *= 0.3
             elevator *= 0.3
             throttle = base_throttle
 
         act = ActuatorControl()
         act.group_mix = 0
-        controls = [0.0]*8
-
-        controls[0] = aileron
-        controls[1] = elevator
-        controls[2] = rudder
-        controls[3] = throttle
-        act.controls = controls
-        act.timestamp = int(self.get_clock().now().nanoseconds // 1000)  # microseconds-ish
+        act.controls = [aileron, elevator, rudder, throttle, 0.0, 0.0, 0.0, 0.0]
 
         self.actuator_pub.publish(act)
 
     def publish_neutral(self):
         act = ActuatorControl()
         act.group_mix = 0
-        controls = [0.0]*8
-        controls[0] = 0.0  # aileron neutral
-        controls[1] = 0.0  # elevator neutral
-        controls[2] = 0.0  # rudder neutral
-        controls[3] = 0.45  # small cruise throttle
-        act.controls = controls
-        act.timestamp = int(self.get_clock().now().nanoseconds // 1000)
+        act.controls = [0.0, 0.0, 0.0, 0.45, 0.0, 0.0, 0.0, 0.0]
         self.actuator_pub.publish(act)
 
 
@@ -216,5 +195,6 @@ def main(args=None):
     node.destroy_node()
     rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if _name_ == '_main_':
     main()
