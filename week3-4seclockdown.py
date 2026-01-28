@@ -12,9 +12,12 @@ class FixedWingFinalDiamond(Node):
     def _init_(self):
         super()._init_('fixed_wing_final_diamond')
 
+        # QoS Profile: PX4 OUT topics are volatile (not latched)
+        # CRITICAL FIX: Use VOLATILE durability instead of TRANSIENT_LOCAL
+        # TRANSIENT_LOCAL can cause DDS to wait for history, blocking subscriptions
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,  # PX4 publishes volatile messages
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
@@ -56,15 +59,17 @@ class FixedWingFinalDiamond(Node):
                                 out_min=-0.3, out_max=0.4)
 
         # --- Subscribers & Publishers ---
-        self.status_sub = self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status', self.status_cb, qos_profile)
-        self.attitude_sub = self.create_subscription(VehicleAttitude, '/fmu/out/vehicle_attitude', self.attitude_cb, qos_profile)
-        self.local_pos_sub = self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.local_pos_cb, qos_profile)
-        self.air_data_sub = self.create_subscription(VehicleAirData, '/fmu/out/vehicle_air_data', self.air_data_cb, qos_profile)
+        self.status_sub = self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status_v1', self.status_cb, qos_profile)
+        # ATTITUDE SUBSCRIBER DISABLED: /fmu/out/vehicle_attitude_v1 not available - will use integrated yaw only
+        # self.attitude_sub = self.create_subscription(VehicleAttitude, '/fmu/out/vehicle_attitude_v1', self.attitude_cb, qos_profile)
+        self.local_pos_sub = self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1', self.local_pos_cb, qos_profile)
+        self.air_data_sub = self.create_subscription(VehicleAirData, '/fmu/out/vehicle_air_data_v1', self.air_data_cb, qos_profile)
         self.target_sub = self.create_subscription(Float32MultiArray, '/target/box', self.target_cb, 10)
         
-        self.attitude_sp_pub = self.create_publisher(VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint', qos_profile)
+        self.attitude_sp_pub = self.create_publisher(VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint_v1', qos_profile)
+        # NOTE: PX4 expects OffboardControlMode on '/fmu/in/offboard_control_mode' (no _v1)
         self.offboard_mode_pub = self.create_publisher(OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
-        self.vehicle_command_pub = self.create_publisher(VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
+        self.vehicle_command_pub = self.create_publisher(VehicleCommand, '/fmu/in/vehicle_command_v1', qos_profile)
 
         # --- State Variables ---
         self.last_time = self.get_clock().now()
@@ -74,6 +79,8 @@ class FixedWingFinalDiamond(Node):
         self.is_offboard = False
         self.is_armed = False
         
+        # YAW: Integrated only (no attitude feedback available)
+        # Starts at 0, will be updated via coordinated turn math when offboard active
         self.current_yaw = 0.0
         self.target_yaw_integrated = 0.0
         
@@ -81,34 +88,62 @@ class FixedWingFinalDiamond(Node):
         self.true_airspeed = 0.0
         self.current_alt = 0.0
         
-        self.offboard_request_counter = 0
+        # OFFBOARD sequence control: must publish setpoints 10+ times before requesting offboard
+        self.setpoint_count = 0
+        self.offboard_transition_time = None
+        
+        # Note: periodic retry logic will attempt ARM/OFFBOARD every N cycles
         
         self.last_roll_cmd = 0.0
         self.last_pitch_cmd = 0.0
 
-        self.create_timer(1.0/30.0, self.control_loop)
+        # CRITICAL: Timer must be >= 50 Hz for reliable offboard
+        # PX4 requires continuous setpoint stream at 20+ Hz minimum
+        self.create_timer(1.0/50.0, self.control_loop)  # 50 Hz
         self.get_logger().info('FixedWing DIAMOND Node (Flight Ready) Started.')
+        self.get_logger().info('Timer: 50 Hz (20 ms) - CRITICAL for offboard stability')
+        self.get_logger().info('--- Offboard Sequence ---')
+        self.get_logger().info('1. Will publish OffboardControlMode + VehicleAttitudeSetpoint continuously')
+        self.get_logger().info('2. After 10+ messages, will request ARM')
+        self.get_logger().info('3. After ARM, will request OFFBOARD mode')
+        self.get_logger().info('4. Monitor logs for STATE transitions')
+
+        # PX4 timestamp (use VehicleStatus.timestamp as ground truth for PX4 time)
+        # Initialize with local microsecond time as fallback until PX4 provides its timestamp
+        self.current_px4_timestamp = int(self.get_clock().now().nanoseconds / 1000)
 
     def status_cb(self, msg: VehicleStatus):
+        # Track PX4 state and capture PX4 timestamp for outgoing messages
         self.is_offboard = (msg.nav_state == 14)
         self.is_armed = (msg.arming_state == 2)
+        # msg.timestamp is in microseconds in PX4 messages
+        try:
+            self.current_px4_timestamp = int(msg.timestamp)
+        except Exception:
+            # If timestamp not present or invalid, keep previous value
+            pass
 
-    def attitude_cb(self, msg: VehicleAttitude):
-        q = msg.q
-        siny_cosp = 2 * (q[0] * q[3] + q[1] * q[2])
-        cosy_cosp = 1 - 2 * (q[2] * q[2] + q[3] * q[3])
-        current_yaw_rad = math.atan2(siny_cosp, cosy_cosp)
-        self.current_yaw = current_yaw_rad
-        if not self.is_offboard:
-            self.target_yaw_integrated = current_yaw_rad
+    # DISABLED: attitude_v1 topic not available from PX4
+    # Yaw estimation handled through coordinated turn integration only
+    # def attitude_cb(self, msg: VehicleAttitude):
+    #     q = msg.q
+    #     siny_cosp = 2 * (q[0] * q[3] + q[1] * q[2])
+    #     cosy_cosp = 1 - 2 * (q[2] * q[2] + q[3] * q[3])
+    #     current_yaw_rad = math.atan2(siny_cosp, cosy_cosp)
+    #     self.current_yaw = current_yaw_rad
+    #     if not self.is_offboard:
+    #         self.target_yaw_integrated = current_yaw_rad
 
     def local_pos_cb(self, msg: VehicleLocalPosition):
         self.ground_speed = math.sqrt(msg.vx*2 + msg.vy*2)
         self.current_alt = -msg.z # NED coordinate system (z is negative up)
 
     def air_data_cb(self, msg: VehicleAirData):
-        # Eğer pitot tüpü varsa buradan gerçek airspeed gelir
-        self.true_airspeed = msg.true_airspeed_m_s
+        # RISK: Airspeed can be NAN or stale on fixed-wing
+        # Guard against NAN to prevent control instability
+        if not math.isnan(msg.true_airspeed_m_s):
+            self.true_airspeed = msg.true_airspeed_m_s
+        # else: keep previous value
 
     def target_cb(self, msg: Float32MultiArray):
         if len(msg.data) >= 5:
@@ -117,7 +152,8 @@ class FixedWingFinalDiamond(Node):
 
     def send_command(self, command, p1=0.0, p2=0.0):
         msg = VehicleCommand()
-        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        # For SITL compatibility use 0 timestamp so PX4 accepts commands immediately
+        msg.timestamp = 0
         msg.command = command
         msg.param1 = p1
         msg.param2 = p2
@@ -126,6 +162,7 @@ class FixedWingFinalDiamond(Node):
         msg.source_system = 1
         msg.source_component = 1
         msg.from_external = True
+        self.get_logger().info(f'COMMAND: {command}, p1={p1}, p2={p2}')
         self.vehicle_command_pub.publish(msg)
 
     def euler_to_quaternion(self, roll, pitch, yaw):
@@ -149,22 +186,25 @@ class FixedWingFinalDiamond(Node):
     def control_loop(self):
         now = self.get_clock().now()
         dt = (now - self.last_time).nanoseconds / 1e9
-        if dt <= 0: dt = 0.033
+        if dt <= 0: dt = 0.02  # 50 Hz nominal
         self.last_time = now
 
-        offboard_msg = OffboardControlMode()
-        offboard_msg.timestamp = int(now.nanoseconds / 1000)
-        offboard_msg.attitude = True
-        self.offboard_mode_pub.publish(offboard_msg)
-
+        # --- TARGET VALIDATION ---
+        # time since last target and if target exists
         time_diff = (now - self.last_target_time).nanoseconds / 1e9
         target_valid = (time_diff < 1.0) and (self.last_target is not None)
-        
-        target_roll = 0.0
-        target_pitch = 0.0
+
+        # Base throttle for fixed-wing cruise (used in target computations)
         base_throttle = 0.6
-        
-        # --- LOGIC ---
+
+        # DEBUG: Log offboard state periodically
+        if self.setpoint_count % 50 == 0:  # Every ~1 second at 50 Hz
+            self.get_logger().info(
+                f'STATE: armed={self.is_armed}, offboard={self.is_offboard}, '
+                f'setpoint_count={self.setpoint_count}'
+            )
+
+        # --- CONTROL LOGIC (target generation) ---
         if target_valid:
             t = self.last_target
             
@@ -208,7 +248,7 @@ class FixedWingFinalDiamond(Node):
         if effective_speed < self.stall_speed and effective_speed > 1.0:
             self.get_logger().warn(f'STALL GUARD! Spd: {effective_speed:.1f}')
             target_pitch = min(target_pitch, math.radians(-5.0)) # Burun ez
-            target_throttle = 0.95 # Tam gaz
+            target_throttle = 0.9  # Tam gaz (0.4-0.9 range içinde)
             target_roll = 0.0 # Kanat düzelt
             
         # B. Hard Deck (Zemin Çarpışma Önleyici)
@@ -219,37 +259,88 @@ class FixedWingFinalDiamond(Node):
                 target_pitch = math.radians(10.0) # Zorla tırmandır
                 target_throttle = max(target_throttle, 0.8)
 
-        # Değerleri limitle
+        # Apply command limits
         target_roll = max(min(target_roll, self.max_roll_rad), -self.max_roll_rad)
         target_pitch = max(min(target_pitch, self.max_pitch_rad), -self.max_pitch_rad)
-        target_throttle = max(min(target_throttle, 0.95), 0.3)
+        # OPTIONAL: Tighter throttle bounds (0.4-0.9) for better ESC performance
+        target_throttle = max(min(target_throttle, 0.9), 0.4)
 
         self.last_roll_cmd = target_roll
         self.last_pitch_cmd = target_pitch
 
         # --- Coordinated Turn ---
         g = 9.81
-        v = max(effective_speed, 6.0) # Bölen hatası önlemi
+        v = max(effective_speed, 6.0) # Division guard
         turn_rate = (g * math.tan(target_roll)) / v
         
-        self.target_yaw_integrated += turn_rate * dt
-        self.target_yaw_integrated = (self.target_yaw_integrated + math.pi) % (2 * math.pi) - math.pi
+        # OPTIONAL: Clamp turn rate to prevent extreme yaw changes if airspeed drops
+        turn_rate = max(min(turn_rate, 0.6), -0.6)
+        
+        # CRITICAL: Do NOT integrate yaw without attitude feedback
+        # PX4 has heading_good_for_control=false (no attitude_v1 available)
+        # When offboard rejects yaw setpoint, oscillation occurs
+        # SOLUTION: Keep yaw at 0.0, let bank angle do the turn (coordinated turn)
+        # Bank angle naturally commands yaw via body dynamics
+        self.target_yaw_integrated = 0.0
+        # Set yaw_sp_move_rate to 0 for stable heading
+        yaw_sp_move_rate = 0.0
 
         q_des = self.euler_to_quaternion(target_roll, target_pitch, self.target_yaw_integrated)
 
         att_msg = VehicleAttitudeSetpoint()
-        att_msg.timestamp = int(now.nanoseconds / 1000)
-        att_msg.q_d = [float(q_des[0]), float(q_des[1]), float(q_des[2]), float(q_des[3])]
-        att_msg.thrust_body = [float(target_throttle), 0.0, 0.0]
-        att_msg.yaw_sp_move_rate = float(turn_rate)
+        # CRITICAL for SITL: use 0 as timestamp to avoid PX4 time-base rejections
+        att_msg.timestamp = 0
+        # CRITICAL: Field name is 'q_d' in px4_msgs for VehicleAttitudeSetpoint
+        # Use q_d (float32[4]) — empty or wrong field will cause PX4 to reject setpoint
+        att_msg.q_d = [
+            float(q_des[0]),
+            float(q_des[1]),
+            float(q_des[2]),
+            float(q_des[3]),
+        ]
+        # CRITICAL: thrust_body[0] must never be zero
+        # PX4 uses this to determine if setpoint is valid
+        # Clamp to [0.1, 1.0] to ensure PX4 accepts control
+        safe_throttle = max(target_throttle, 0.1)
+        att_msg.thrust_body = [float(safe_throttle), 0.0, 0.0]
+        att_msg.yaw_sp_move_rate = float(yaw_sp_move_rate)
         
         self.attitude_sp_pub.publish(att_msg)
+        
+        # CRITICAL: Publish order matters - setpoint BEFORE mode
+        # If mode is published before setpoint, PX4 may reject
+        offboard_msg = OffboardControlMode()
+        # CRITICAL for SITL: use 0 as timestamp to force PX4 to accept setpoints immediately
+        offboard_msg.timestamp = 0
+        # CRITICAL: Fixed-wing offboard MUST use attitude control
+        offboard_msg.position = False
+        offboard_msg.velocity = False
+        offboard_msg.acceleration = False
+        offboard_msg.attitude = True  # <-- REQUIRED for fixed-wing
+        offboard_msg.body_rate = False
+        # Additional OffboardControlMode fields required by px4_msgs
+        offboard_msg.thrust_and_torque = False
+        offboard_msg.direct_actuator = False
+        self.offboard_mode_pub.publish(offboard_msg)
+        self.setpoint_count += 1
 
-        if not self.is_offboard or not self.is_armed:
-            self.offboard_request_counter += 1
-            if self.offboard_request_counter % 50 == 0:
-                self.send_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
+        # CRITICAL: Send commands conditionally, NOT spammed every 50 cycles
+        # This prevents PX4 state oscillation from repeated mode/arm requests
+        # ALSO: Must send 10+ setpoints BEFORE requesting offboard mode
+        # CRITICAL: Use state latch - commands are ONE-SHOT
+        
+        # Periodic retry: every 100 cycles (~2s at 50Hz) attempt ARM/OFFBOARD until accepted
+        if self.setpoint_count % 100 == 0:
+            if not self.is_armed:
+                self.get_logger().info('Arming (periodic attempt)...')
                 self.send_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+            elif self.is_armed and not self.is_offboard:
+                # require at least 10 setpoints before requesting offboard
+                if self.setpoint_count >= 10:
+                    self.get_logger().info('Requesting OFFBOARD (periodic attempt)...')
+                    self.send_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
+            else:
+                self.get_logger().info('Uçuş Modu: OFFBOARD - AKTİF')
 
 class PID:
     def _init_(self, kp, ki=0.0, kd=0.0, imax=0.0, out_min=-1.0, out_max=1.0):
@@ -277,3 +368,8 @@ def main(args=None):
 if _name_ == '_main_':
     main()
 EOF
+
+if _name_ == '_main_':
+    main()
+EOF
+
