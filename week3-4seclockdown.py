@@ -7,7 +7,7 @@ from px4_msgs.msg import VehicleAttitudeSetpoint, OffboardControlMode, VehicleSt
 import time
 import math
 import numpy as np
-target_roll
+
 class FixedWingFinalDiamond(Node):
     def _init_(self):
         super()._init_('fixed_wing_final_diamond')
@@ -410,3 +410,4 @@ def main(args=None):
 if _name_ == '_main_':
     main()
 EOF
+
