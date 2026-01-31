@@ -7,7 +7,7 @@ from px4_msgs.msg import VehicleAttitudeSetpoint, OffboardControlMode, VehicleSt
 import time
 import math
 import numpy as np
-
+target_roll
 class FixedWingFinalDiamond(Node):
     def _init_(self):
         super()._init_('fixed_wing_final_diamond')
@@ -32,6 +32,14 @@ class FixedWingFinalDiamond(Node):
         # Limitler
         self.declare_parameter('max_roll_deg', 55.0)
         self.declare_parameter('max_pitch_deg', 20.0)
+        # --- WEEK 3: Dönüş Yumuşatma & Takip Karar Parametreleri ek ---
+        self.declare_parameter('max_track_roll_deg', 20.0)   # hedef takip için izin verilen max roll
+        self.declare_parameter('roll_rate_limit_deg', 60.0)  # saniyede max roll değişimi
+        self.declare_parameter('lock_time_required', 4.0)    # saniye
+        self.max_track_roll = math.radians(self.get_parameter('max_track_roll_deg').value)
+        self.max_roll_rate = math.radians(self.get_parameter('roll_rate_limit_deg').value)
+        self.lock_time_required = self.get_parameter('lock_time_required').value
+
         
         # PID Kazançları
         self.declare_parameter('roll_kp', 1.8)  
@@ -75,6 +83,10 @@ class FixedWingFinalDiamond(Node):
         self.last_time = self.get_clock().now()
         self.last_target_time = self.get_clock().now()
         self.last_target = None
+        # --- WEEK 3: Target Lock State ek ---
+        self.lock_start_time = None
+        self.target_locked = False
+
         
         self.is_offboard = False
         self.is_armed = False
@@ -149,6 +161,10 @@ class FixedWingFinalDiamond(Node):
         if len(msg.data) >= 5:
             self.last_target_time = self.get_clock().now()
             self.last_target = {'cx': msg.data[0], 'cy': msg.data[1], 'dist': msg.data[4]}
+            # week 3 ek
+            if self.lock_start_time is None:
+              self.lock_start_time = now
+              self.target_locked = False
 
     def send_command(self, command, p1=0.0, p2=0.0):
         msg = VehicleCommand()
@@ -216,7 +232,22 @@ class FixedWingFinalDiamond(Node):
             # 2. PID
             target_roll = self.roll_pid.update(angle_err_x, dt)
             target_pitch = self.pitch_pid.update(angle_err_y, dt)
-            
+            # --- WEEK 3: 4s Target Lock Logic ---
+            lock_elapsed = 0.0
+            if self.lock_start_time is not None:
+              lock_elapsed = (now - self.lock_start_time).nanoseconds / 1e9
+            if lock_elapsed >= self.lock_time_required:
+              self.target_locked = True
+            # --- WEEK 3: takip uygunluğu ek ---
+            if abs(target_roll) > self.max_track_roll:
+              # İzin verilen açı aşılıyorsa takibi bırak
+              self.target_locked = False
+              self.lock_start_time = None
+             # --- 4.3 FIX: Takibi bırakma YOK, sadece saturasyon ---
+             if abs(target_roll) > self.max_track_roll:
+              target_roll = math.copysign(self.max_track_roll, target_roll)
+
+    
             # 3. Energy Mixing (TECS Emulation + Bank Compensation)
             # Pitch Up -> Throttle Up
             pitch_throttle_ff = max(0.0, target_pitch) * (0.25 / math.radians(20))
@@ -225,9 +256,19 @@ class FixedWingFinalDiamond(Node):
             
             pid_thr = self.throttle_pid.update(err_dist, dt)
             target_throttle = base_throttle + pid_thr + pitch_throttle_ff + roll_throttle_ff
+            # --- WEEK 3: roll sınırı ek ---
+            max_delta_roll = self.max_roll_rate * dt
+            roll_delta = target_roll - self.last_roll_cmd
+            if abs(roll_delta) > max_delta_roll:
+              target_roll = self.last_roll_cmd + math.copysign(max_delta_roll, roll_delta)
+
 
         else:
             # --- Hedef Kaybı: Smooth Decay & Loiter ---
+            # --- WEEK 3: hedef kaybı ek ---
+            self.lock_start_time = None
+            self.target_locked = False
+
             if time_diff < 3.0:
                 decay_factor = 0.95
                 target_roll = self.last_roll_cmd * decay_factor
@@ -240,6 +281,7 @@ class FixedWingFinalDiamond(Node):
                 target_roll = math.radians(20.0) 
                 target_pitch = math.radians(3.0) # Hafif tırmanış
                 target_throttle = 0.65
+        
 
         # --- SAFETY: Hız ve İrtifa Korumaları ---
         effective_speed = self.get_effective_speed()
@@ -368,8 +410,3 @@ def main(args=None):
 if _name_ == '_main_':
     main()
 EOF
-
-if _name_ == '_main_':
-    main()
-EOF
-
