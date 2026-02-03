@@ -198,7 +198,7 @@ class FixedWingFinalDiamond(Node):
             self.target_yaw_integrated = current_yaw_rad
 
     def local_pos_cb(self, msg: VehicleLocalPosition):
-        self.ground_speed = math.sqrt(msg.vx*2 + msg.vy*2)
+        self.ground_speed = math.sqrt(msg.vx**2 + msg.vy**2)
         self.current_alt = -msg.z # NED coordinate system (z is negative up)
 
     def air_data_cb(self, msg: VehicleAirData):
@@ -900,3 +900,4 @@ def main(args=None):
 if _name_ == '_main_':
     main()
 EOF
+
