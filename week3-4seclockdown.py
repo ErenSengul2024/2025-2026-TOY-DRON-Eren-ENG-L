@@ -1,4 +1,4 @@
-,import rclpy
+import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import Float32MultiArray
@@ -593,4 +593,5 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
 
